@@ -1,0 +1,107 @@
+# remediate-tls-icmp-rfds.yml
+---
+- name: Remediate ICMP timestamp disclosure, deprecated TLS, and RFDS kernel mitigation
+  hosts: "{{ target_hosts | default('all') }}"
+  become: true
+
+  vars:
+    allow_reboot: false   # the RFDS fix needs a reboot to actually take effect
+
+  tasks:
+
+    ## CVE-1999-0524 — ICMP Timestamp Reply Information Disclosure
+    - name: Ensure iptables-persistent is installed so the rule survives reboot
+      apt:
+        name: iptables-persistent
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Drop incoming ICMP timestamp requests (type 13)
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: icmp
+        icmp_type: "13"
+        jump: DROP
+        comment: "Block ICMP timestamp requests - CVE-1999-0524"
+      when: ansible_os_family == "Debian"
+
+    - name: Persist the iptables rule
+      command: netfilter-persistent save
+      when: ansible_os_family == "Debian"
+      changed_when: true
+
+    ## Deprecated TLSv1.0 / TLSv1.1 (covers CVE-2011-3389, CVE-2015-0204,
+    ## CVE-2023-41928, CVE-2024-41270, CVE-2025-3200 — all the same underlying issue)
+    - name: Check whether Apache is installed
+      stat:
+        path: /etc/apache2/mods-available/ssl.conf
+      register: apache_ssl_conf
+
+    - name: Disable TLSv1.0/1.1 in Apache, if present
+      lineinfile:
+        path: /etc/apache2/mods-available/ssl.conf
+        regexp: '^\s*SSLProtocol'
+        line: '        SSLProtocol -all +TLSv1.2 +TLSv1.3'
+      when: apache_ssl_conf.stat.exists
+      notify: restart apache2
+
+    - name: Check whether nginx is installed
+      stat:
+        path: /etc/nginx/nginx.conf
+      register: nginx_conf
+
+    - name: Disable TLSv1.0/1.1 in nginx, if present
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        regexp: '^\s*ssl_protocols'
+        line: '    ssl_protocols TLSv1.2 TLSv1.3;'
+        insertafter: 'http {'
+      when: nginx_conf.stat.exists
+      notify: restart nginx
+
+    - name: Flag if neither web server config was found
+      debug:
+        msg: >
+          Neither Apache nor nginx config found, but OpenVAS reports deprecated TLS.
+          Run `ss -tlnp` on this host to find what's actually serving the affected
+          port, then extend this playbook to target that service specifically.
+      when: not apache_ssl_conf.stat.exists and not nginx_conf.stat.exists
+
+    ## CVE-2023-28746 — Missing RFDS kernel mitigation (Intel-specific)
+    - name: Ensure intel-microcode is installed and current
+      apt:
+        name: intel-microcode
+        state: latest
+        update_cache: true
+      register: microcode_result
+      when: ansible_os_family == "Debian"
+
+    - name: Check current RFDS mitigation status
+      command: cat /sys/devices/system/cpu/vulnerabilities/reg_file_data_sampling
+      register: rfds_status
+      changed_when: false
+      failed_when: false
+
+    - name: Show RFDS mitigation status
+      debug:
+        var: rfds_status.stdout
+
+    - name: Reboot if microcode was updated and reboot is allowed
+      reboot:
+        msg: "Rebooting to load updated microcode for RFDS mitigation"
+        reboot_timeout: 600
+      when:
+        - microcode_result is defined
+        - microcode_result.changed
+        - allow_reboot | bool
+
+  handlers:
+    - name: restart apache2
+      service:
+        name: apache2
+        state: restarted
+
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted

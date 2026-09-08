@@ -1,0 +1,120 @@
+---
+# vulnerabilities/python3-pip-whl-esm.yml
+#
+# Remediates OpenVAS/Wazuh findings for python3-pip-whl on Ubuntu hosts.
+#
+# All three detections you pasted are the SAME package needing the SAME
+# fix: the installed 24.0+dfsg-1ubuntu1.3 build is behind three
+# incremental Ubuntu ESM (Extended Security Maintenance) patch levels
+# (+esm1, +esm2, +esm3). Upgrading once to +esm3 or later closes all
+# three findings in one pass -- there is nothing to install "three times".
+#
+# Scanner references (fill these in from your OpenVAS/Wazuh report so the
+# remediation stays traceable back to the original findings):
+#   - CVE / NVT OID for the esm1 fix: <fill in>
+#   - CVE / NVT OID for the esm2 fix: <fill in>
+#   - CVE / NVT OID for the esm3 fix: <fill in>
+#
+# REQUIRES Ubuntu Pro attached with the "esm-apps" service enabled on the
+# target host -- +esmN builds are published to the esm-apps repository,
+# NOT the standard Ubuntu archive. Without it, apt will simply have
+# nothing newer to install and the host will stay vulnerable. Ubuntu Pro
+# is free for personal use / small fleets (up to 5 machines) -- sign up
+# at ubuntu.com/pro to get a token if you don't have one yet.
+#
+# Host targeting: this play uses "hosts: all" on purpose. In AWX you
+# choose which machines actually run it via the Job Template's
+# Inventory + Limit fields (or a Smart Inventory built from your
+# OpenVAS/Wazuh findings) -- nothing to edit here for that.
+
+- name: "Remediate python3-pip-whl ESM vulnerabilities (esm1/esm2/esm3)"
+  hosts: all
+  become: true
+  gather_facts: true
+  tags:
+    - python3-pip-whl
+    - esm-fixes
+
+  vars:
+    remediation_package: "python3-pip-whl"
+    remediation_min_version: "24.0+dfsg-1ubuntu1.3+esm3"
+    # Supply via an AWX extra var backed by a Credential/Survey password
+    # field -- never hardcode a real token in this file. Leave blank if
+    # Ubuntu Pro is already attached on your hosts.
+    ubuntu_pro_token: ""
+
+  tasks:
+    - name: Skip hosts that are not Debian/Ubuntu family
+      ansible.builtin.meta: end_host
+      when: ansible_facts['os_family'] != "Debian"
+
+    - name: Check whether python3-pip-whl is installed
+      ansible.builtin.command: dpkg-query -W -f='${Version}' python3-pip-whl
+      register: pip_whl_before
+      changed_when: false
+      failed_when: false
+
+    - name: Skip hosts where the package isn't installed at all
+      ansible.builtin.meta: end_host
+      when: pip_whl_before.rc != 0
+
+    - name: Report current version before remediation
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: python3-pip-whl currently {{ pip_whl_before.stdout }}"
+
+    - name: Attach Ubuntu Pro and enable esm-apps (only if a token was supplied)
+      when: (ubuntu_pro_token | default('')) | length > 0
+      block:
+        - name: Attach Ubuntu Pro subscription
+          ansible.builtin.command: "ua attach {{ ubuntu_pro_token }}"
+          register: ua_attach
+          changed_when: "'This machine is now attached' in ua_attach.stdout"
+          failed_when: false
+          no_log: true
+
+        - name: Enable esm-apps service
+          ansible.builtin.command: ua enable esm-apps --assume-yes
+          register: ua_enable
+          changed_when: "'esm-apps' in ua_enable.stdout and 'enabled' in ua_enable.stdout"
+          failed_when: false
+
+    - name: Update apt package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Upgrade python3-pip-whl to the fixed ESM version
+      ansible.builtin.apt:
+        name: "{{ remediation_package }}"
+        state: latest
+        only_upgrade: true
+      register: apt_upgrade_result
+
+    - name: Read installed version after remediation
+      ansible.builtin.command: dpkg-query -W -f='${Version}' python3-pip-whl
+      register: pip_whl_after
+      changed_when: false
+
+    - name: Compare installed version against required fixed version
+      ansible.builtin.command: >-
+        dpkg --compare-versions "{{ pip_whl_after.stdout }}" ge "{{ remediation_min_version }}"
+      register: version_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail clearly if still vulnerable
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }}: python3-pip-whl is still {{ pip_whl_after.stdout }},
+          which does not meet the required fixed version {{ remediation_min_version }}.
+          This almost always means the esm-apps repository isn't enabled on this host --
+          confirm Ubuntu Pro is attached (pass ubuntu_pro_token) and esm-apps is enabled,
+          then re-run this playbook.
+      when: version_check.rc != 0
+
+  post_tasks:
+    - name: Report remediation outcome
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: python3-pip-whl {{ pip_whl_before.stdout }} ->
+          {{ pip_whl_after.stdout }} (required >= {{ remediation_min_version }}). REMEDIATED.

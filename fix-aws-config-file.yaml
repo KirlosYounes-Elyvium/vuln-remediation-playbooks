@@ -1,0 +1,24 @@
+---
+# Persists AWS_CONFIG_FILE=/etc/aws/config system-wide via /etc/environment,
+# so the aws CLI finds the silo profile by default for every user/service
+# (systemd units, cron, interactive shells) without setting the variable
+# per-invocation. Debian/Ubuntu-specific: systemd reads /etc/environment as
+# default environment for all services on these distros.
+#
+# Idempotent equivalent of:
+#   echo 'AWS_CONFIG_FILE=/etc/aws/config' | sudo tee -a /etc/environment
+# (using lineinfile instead of a raw append, so re-running this doesn't
+# duplicate the line).
+ 
+- name: Persist AWS_CONFIG_FILE system-wide
+  hosts: database
+  become: true
+ 
+  tasks:
+    - name: Ensure AWS_CONFIG_FILE=/etc/aws/config is set in /etc/environment
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        regexp: '^AWS_CONFIG_FILE='
+        line: 'AWS_CONFIG_FILE=/etc/aws/config'
+        state: present
+ 

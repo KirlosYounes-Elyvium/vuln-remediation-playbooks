@@ -11,7 +11,7 @@
 # duplicate the line).
  
 - name: Persist AWS_CONFIG_FILE system-wide
-  hosts: database
+  hosts: all
   become: true
  
   tasks:

@@ -1,0 +1,190 @@
+---
+# Kernel-only patching: fixes the vulnerable linux-image-6.8.0-* findings.
+#
+# What it does (nothing else on the system is upgraded):
+#   1. Refreshes the HashiCorp apt key so `apt update` is clean
+#   2. apt update
+#   3. apt install --only-upgrade linux-image-generic linux-headers-generic linux-generic
+#   4. Reboots into the new kernel ONLY if reboot_if_required=true
+#      (never on hosts with a LUKS loopback volume - see luks_marker below)
+#   5. Once a node is running the newest installed kernel, purges every OLDER
+#      kernel package (image / modules / headers / tools). This is what actually
+#      clears the Wazuh findings - upgrading the metapackages alone leaves the old
+#      linux-image-6.8.0-85/137/139/142 packages installed.
+#
+# Targeting: set Inventory / Limit in the AWX Job Template (hosts: all here).
+#
+# Extra vars:
+#   reboot_if_required=true   reboot nodes that need it
+#   skip_cleanup=true         don't purge old kernels
+#
+# Tags: kernel (everything), hashicorp_key, cleanup
+#
+# Typical flow: run once (installs new kernel, no reboot) -> reboot nodes at a
+# safe time (unlock LUKS / unseal Vault as needed) -> run again (purges old kernels).
+
+- name: Patch kernel packages and remove old kernels
+  hosts: all
+  become: true
+  tags: [kernel]
+  vars:
+    hashicorp_key_url: https://apt.releases.hashicorp.com/gpg
+    hashicorp_keyring: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    kernel_metapackages:
+      - linux-image-generic
+      - linux-headers-generic
+      - linux-generic
+    reboot_if_required: false
+    skip_cleanup: false
+    # Hosts with this file use a LUKS loopback volume that needs a MANUAL unlock
+    # after every reboot (archive01 incident). Never auto-reboot them.
+    luks_marker: /srv/silo-crypt.img
+
+  tasks:
+    # ---- 1. HashiCorp key ---------------------------------------------------
+    - name: Ensure gnupg and ca-certificates are present
+      ansible.builtin.apt:
+        name: [gnupg, ca-certificates]
+        state: present
+        lock_timeout: 300
+      tags: [hashicorp_key]
+
+    - name: Download the current HashiCorp key (armored)
+      ansible.builtin.get_url:
+        url: "{{ hashicorp_key_url }}"
+        dest: /tmp/hashicorp-gpg.asc
+        mode: "0644"
+        force: true
+      tags: [hashicorp_key]
+
+    - name: Convert the key to binary keyring format
+      ansible.builtin.command: >
+        gpg --batch --yes --dearmor
+        -o /tmp/hashicorp-archive-keyring.gpg /tmp/hashicorp-gpg.asc
+      changed_when: false
+      tags: [hashicorp_key]
+
+    - name: Install the keyring where the apt source expects it
+      ansible.builtin.copy:
+        src: /tmp/hashicorp-archive-keyring.gpg
+        dest: "{{ hashicorp_keyring }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      tags: [hashicorp_key]
+
+    - name: Remove temporary key files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/hashicorp-gpg.asc
+        - /tmp/hashicorp-archive-keyring.gpg
+      tags: [hashicorp_key]
+
+    # ---- 2. apt update ------------------------------------------------------
+    - name: apt update
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+        lock_timeout: 300
+
+    - name: Fail if any repo still has a signature/key problem
+      ansible.builtin.shell: |
+        apt-get update 2>&1 | grep -E 'NO_PUBKEY|EXPKEYSIG|KEYEXPIRED|is not signed' || true
+      register: keycheck
+      changed_when: false
+      failed_when: keycheck.stdout | length > 0
+
+    # ---- 3. kernel-only upgrade --------------------------------------------
+    - name: Upgrade ONLY the kernel metapackages (apt install --only-upgrade)
+      ansible.builtin.apt:
+        name: "{{ kernel_metapackages }}"
+        state: latest
+        only_upgrade: true
+        lock_timeout: 300
+      register: kernel_upgrade
+
+    # ---- 4. reboot (opt-in, guarded) ---------------------------------------
+    - name: Check whether a reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+
+    - name: Check for LUKS loopback volume that needs manual unlock
+      ansible.builtin.stat:
+        path: "{{ luks_marker }}"
+      register: luks_img
+
+    - name: Report reboot status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: reboot required = {{ reboot_flag.stat.exists }};
+          auto-reboot = {{ (reboot_if_required | bool) and not luks_img.stat.exists }}
+          {{ '(LUKS volume present - reboot manually, then unlock/mount before starting services)' if luks_img.stat.exists else '' }}
+
+    - name: Reboot into the new kernel
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+      when:
+        - reboot_flag.stat.exists
+        - reboot_if_required | bool
+        - not luks_img.stat.exists
+
+    # ---- 5. purge old kernels (only once the newest is running) ------------
+    - name: Get running kernel
+      ansible.builtin.command: uname -r
+      register: running_kernel
+      changed_when: false
+      tags: [cleanup]
+
+    - name: Get newest installed kernel version
+      ansible.builtin.shell: |
+        set -o pipefail
+        dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\n' 'linux-image-[0-9]*' \
+          | awk -F'\t' '$1 ~ /^ii/ {sub(/^linux-image-/, "", $2); print $2}' \
+          | sort -V | tail -n1
+      args:
+        executable: /bin/bash
+      register: newest_kernel
+      changed_when: false
+      tags: [cleanup]
+
+    - name: List installed packages belonging to older kernels
+      ansible.builtin.shell: |
+        set -o pipefail
+        base=$(echo '{{ running_kernel.stdout }}' | sed -E 's/-[a-z]+$//')
+        dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\n' \
+          | awk -F'\t' '$1 ~ /^(ii|rc)/ {print $2}' \
+          | grep -E '^linux-(image|image-unsigned|headers|modules|modules-extra|tools|cloud-tools|buildinfo)-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' \
+          | grep -Ev -- "-${base}(-|$)" || true
+      args:
+        executable: /bin/bash
+      register: old_kernels
+      changed_when: false
+      when: not skip_cleanup | bool
+      tags: [cleanup]
+
+    - name: Purge older kernels (running kernel is the newest installed)
+      ansible.builtin.apt:
+        name: "{{ old_kernels.stdout_lines }}"
+        state: absent
+        purge: true
+        lock_timeout: 300
+      when:
+        - not skip_cleanup | bool
+        - old_kernels.stdout_lines | length > 0
+        - running_kernel.stdout == newest_kernel.stdout
+      tags: [cleanup]
+
+    - name: Cleanup skipped - node has not booted the newest kernel yet
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: running {{ running_kernel.stdout }}, newest installed
+          {{ newest_kernel.stdout }}. Old kernels NOT removed. Reboot, then re-run this playbook.
+          Would remove: {{ old_kernels.stdout_lines | default([]) }}
+      when:
+        - not skip_cleanup | bool
+        - running_kernel.stdout != newest_kernel.stdout
+      tags: [cleanup]

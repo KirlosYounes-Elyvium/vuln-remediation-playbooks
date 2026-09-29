@@ -1,16 +1,99 @@
-# update-upgrade-system.yml
 ---
-- name: Update and upgrade the system
-  hosts: "{{ target_hosts | default('all') }}"
+# Refreshes the HashiCorp apt signing key, then runs apt update + apt upgrade.
+#
+# Run:   ansible-playbook -i <inventory> patch-hashicorp-key-and-upgrade.yml
+# Limit: ... --limit patch01
+# Reboot automatically if needed: ... -e reboot_if_required=true
+# Full upgrade (like apt full-upgrade): ... -e upgrade_mode=dist
+
+- name: Refresh HashiCorp apt key and upgrade the system
+  hosts: all
   become: true
+  vars:
+    hashicorp_key_url: https://apt.releases.hashicorp.com/gpg
+    # Matches the standard HashiCorp install line:
+    #   deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com noble main
+    hashicorp_keyring: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    upgrade_mode: safe          # safe = apt upgrade, dist = apt full-upgrade
+    reboot_if_required: false
 
   tasks:
-    - name: Update apt cache
-      apt:
-        update_cache: true
-      when: ansible_os_family == "Debian"
+    # ---- 1. HashiCorp key ---------------------------------------------------
+    - name: Ensure gnupg and ca-certificates are present
+      ansible.builtin.apt:
+        name:
+          - gnupg
+          - ca-certificates
+        state: present
+        lock_timeout: 300
 
-    - name: Upgrade all packages
-      apt:
-        upgrade: dist
-      when: ansible_os_family == "Debian"
+    - name: Download the current HashiCorp key (armored)
+      ansible.builtin.get_url:
+        url: "{{ hashicorp_key_url }}"
+        dest: /tmp/hashicorp-gpg.asc
+        mode: "0644"
+        force: true
+
+    - name: Convert the key to binary keyring format
+      ansible.builtin.command: >
+        gpg --batch --yes --dearmor
+        -o /tmp/hashicorp-archive-keyring.gpg /tmp/hashicorp-gpg.asc
+      changed_when: false
+
+    - name: Install the keyring where the apt source expects it
+      ansible.builtin.copy:
+        src: /tmp/hashicorp-archive-keyring.gpg
+        dest: "{{ hashicorp_keyring }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Remove temporary key files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/hashicorp-gpg.asc
+        - /tmp/hashicorp-archive-keyring.gpg
+
+    # ---- 2. apt update ------------------------------------------------------
+    - name: apt update
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+        lock_timeout: 300
+
+    - name: Fail if any repo still has a signature/key problem
+      ansible.builtin.shell: |
+        apt-get update 2>&1 | grep -E 'NO_PUBKEY|EXPKEYSIG|KEYEXPIRED|is not signed' || true
+      register: keycheck
+      changed_when: false
+      failed_when: keycheck.stdout | length > 0
+
+    # ---- 3. apt upgrade -----------------------------------------------------
+    - name: apt upgrade
+      ansible.builtin.apt:
+        upgrade: "{{ upgrade_mode }}"
+        lock_timeout: 300
+      register: upgrade_result
+
+    - name: Show what was upgraded
+      ansible.builtin.debug:
+        msg: "{{ upgrade_result.stdout_lines | default([]) | select('search', 'upgraded,') | list }}"
+
+    # ---- 4. reboot check ----------------------------------------------------
+    - name: Check whether a reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+
+    - name: Report reboot requirement
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: reboot required ({{ 'rebooting now' if reboot_if_required else 'not rebooting, reboot_if_required=false' }})"
+      when: reboot_flag.stat.exists
+
+    - name: Reboot if required and allowed
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+      when: reboot_flag.stat.exists and reboot_if_required | bool

@@ -1,0 +1,16 @@
+# update-upgrade-system.yml
+---
+- name: Update and upgrade the system
+  hosts: "{{ target_hosts | default('all') }}"
+  become: true
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+      when: ansible_os_family == "Debian"

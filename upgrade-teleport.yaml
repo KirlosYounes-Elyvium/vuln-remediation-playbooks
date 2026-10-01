@@ -1,0 +1,28 @@
+---
+# Upgrades the teleport package to the latest version and restarts the service.
+# Auth must lead the cluster version-wise, so run this against add-jump first,
+# confirm it's healthy, then run it against database:
+#
+#   ansible-playbook upgrade-teleport.yml --limit add-jump
+#   ansible-playbook upgrade-teleport.yml --limit database
+#
+- name: Upgrade Teleport and restart service
+  hosts: teleport_agents
+  become: true
+  serial: 1
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: true
+
+    - name: Upgrade teleport package only
+      apt:
+        name: teleport
+        state: latest
+        only_upgrade: true
+
+    - name: Restart teleport service
+      systemd:
+        name: teleport
+        state: restarted

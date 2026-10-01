@@ -7,7 +7,6 @@
 #   ansible-playbook upgrade-teleport.yml --limit database
 #
 - name: Upgrade Teleport and restart service
-  hosts: teleport_agents
   become: true
   serial: 1
 

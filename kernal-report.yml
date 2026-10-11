@@ -1,0 +1,158 @@
+---
+# kernel-report.yml
+#
+# READ-ONLY. Reports, per Ubuntu/Debian host:
+#   - the kernel that is actually running (uname -r)
+#   - every installed linux-image package (the ones Wazuh/OpenVAS flag)
+#   - the newest installed kernel of the same flavor as the running one
+#   - which installed kernels are safe purge candidates (not running, not newest)
+#   - whether a reboot is pending / a newer kernel is available in the apt cache
+#
+# Changes nothing: no apt writes, no package removal, no reboot, no become.
+# Safe to run with "Prompt on launch: check mode" either way.
+#
+# AWX job template: Playbook = kernel-report.yml, Inventory = fleet,
+# Privilege escalation = OFF (nothing here needs root).
+#
+# Status values:
+#   OK                    running == newest installed, nothing stale
+#   A_STALE_KERNELS       running == newest installed, old kernels still on disk
+#                         -> purge is safe, no reboot needed
+#   B_RUNNING_BEHIND      a newer kernel is installed than the one running
+#                         -> needs a reboot (or livepatch) to actually be patched
+#   C_RUNNING_NOT_PACKAGED running kernel has no installed linux-image package
+#                         -> custom/removed kernel, investigate by hand
+#   SKIPPED_NON_DEBIAN    host is not Debian family
+
+- name: Report running vs installed kernels
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: true
+  gather_subset:
+    - min
+  become: false
+
+  vars:
+    kernel_pkg_globs:
+      - 'linux-image-[0-9]*'
+      - 'linux-image-unsigned-[0-9]*'
+
+  tasks:
+    - name: Skip non-Debian hosts
+      ansible.builtin.set_fact:
+        kernel_report:
+          status: SKIPPED_NON_DEBIAN
+          running: n/a
+          newest_installed: n/a
+          installed: []
+          purge_candidates: []
+          reboot_required: false
+          update_available: false
+      when: ansible_facts.os_family != 'Debian'
+
+    - name: Collect kernel data
+      when: ansible_facts.os_family == 'Debian'
+      block:
+        - name: Get running kernel release
+          ansible.builtin.command: uname -r
+          register: running_out
+          changed_when: false
+          check_mode: false
+
+        # sort -V gives true version order (…-85 < …-137 < …-146).
+        # dpkg-query exits 1 when one glob matches nothing, so rc is ignored.
+        - name: List installed kernel image packages (version-sorted)
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              dpkg-query -W -f='${db:Status-Abbrev}|${Package}\n' {{ kernel_pkg_globs | map('quote') | join(' ') }} 2>/dev/null \
+                | awk -F'|' '$1 ~ /^ii/ {print $2}' \
+                | sed -E 's/^linux-image-(unsigned-)?//' \
+                | sort -uV
+              true
+            executable: /bin/bash
+          register: installed_out
+          changed_when: false
+          check_mode: false
+
+        - name: Check for pending reboot flag
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: reboot_flag
+
+        # Uses the host's existing apt cache only; does not refresh it.
+        - name: Check apt cache for a newer kernel package
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              apt list --upgradable 2>/dev/null | grep -cE '^linux-(image|generic|virtual|aws|azure|gcp|kvm|oem)' || true
+            executable: /bin/bash
+          register: upgradable_out
+          changed_when: false
+          check_mode: false
+
+        - name: Work out kernel state
+          ansible.builtin.set_fact:
+            kernel_report: >-
+              {%- set running = running_out.stdout | trim -%}
+              {%- set flavor = running.split('-')[-1] -%}
+              {%- set installed = installed_out.stdout_lines | map('trim') | reject('equalto', '') | list -%}
+              {%- set same_flavor = installed | select('match', '.*-' ~ flavor ~ '$') | list -%}
+              {%- set newest = (same_flavor | last) if same_flavor else 'none' -%}
+              {%- set candidates = installed | reject('equalto', running) | reject('equalto', newest) | list -%}
+              {%- if running not in installed -%}
+                {%- set status = 'C_RUNNING_NOT_PACKAGED' -%}
+              {%- elif running != newest -%}
+                {%- set status = 'B_RUNNING_BEHIND' -%}
+              {%- elif candidates | length > 0 -%}
+                {%- set status = 'A_STALE_KERNELS' -%}
+              {%- else -%}
+                {%- set status = 'OK' -%}
+              {%- endif -%}
+              {{ {
+                'status': status,
+                'running': running,
+                'newest_installed': newest,
+                'installed': installed,
+                'purge_candidates': candidates,
+                'reboot_required': reboot_flag.stat.exists,
+                'update_available': (upgradable_out.stdout | trim | int) > 0
+              } }}
+
+    # Aggregated into the AWX job "artifacts" so a downstream workflow node
+    # (e.g. the purge job) can read kernel_report_summary.
+    - name: Publish result to job artifacts
+      ansible.builtin.set_stats:
+        data:
+          kernel_report_summary: "{{ {inventory_hostname: kernel_report} }}"
+        per_host: false
+        aggregate: true
+
+    - name: Print per-host summary table
+      ansible.builtin.debug:
+        msg: >-
+          {{ '%-30s %-24s %-24s %-22s %-3s %-3s %s' | format(
+               'HOST', 'RUNNING', 'NEWEST INSTALLED', 'STATUS', 'RB', 'UPD', 'PURGE CANDIDATES'),
+             '%-30s %-24s %-24s %-22s %-3s %-3s %s' | format(
+               inventory_hostname,
+               kernel_report.running,
+               kernel_report.newest_installed,
+               kernel_report.status,
+               'Y' if kernel_report.reboot_required else '-',
+               'Y' if kernel_report.update_available else '-',
+               kernel_report.purge_candidates | join(', ') or '-') }}
+
+    - name: Fleet totals  # noqa: run-once[task]  (play uses the default linear strategy)
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.debug:
+        msg: >-
+          {%- set reports = ansible_play_hosts_all
+                | map('extract', hostvars, 'kernel_report')
+                | select('defined') | list -%}
+          Hosts reported: {{ reports | length }} of {{ ansible_play_hosts_all | length }}
+          (unreachable/failed hosts are listed in the AWX job summary).
+          OK: {{ reports | selectattr('status', 'equalto', 'OK') | list | length }},
+          A_STALE_KERNELS (purge, no reboot): {{ reports | selectattr('status', 'equalto', 'A_STALE_KERNELS') | list | length }},
+          B_RUNNING_BEHIND (needs reboot/livepatch): {{ reports | selectattr('status', 'equalto', 'B_RUNNING_BEHIND') | list | length }},
+          C_RUNNING_NOT_PACKAGED (investigate): {{ reports | selectattr('status', 'equalto', 'C_RUNNING_NOT_PACKAGED') | list | length }},
+          Stale kernel packages removable fleet-wide: {{ reports | map(attribute='purge_candidates') | map('length') | sum }}

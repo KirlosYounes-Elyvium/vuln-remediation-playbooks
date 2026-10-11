@@ -1,0 +1,321 @@
+---
+# yamllint disable rule:line-length
+# reboot-audit.yml
+#
+# READ-ONLY. Changes nothing on the hosts: no restarts, no package or config
+# changes, no reboot. It needs root only to read state (firewall rules,
+# docker, dm-crypt), so the job template should have Privilege Escalation ON.
+#
+# Two phases (extra variable audit_phase):
+#
+#   pre  (default)  Looks for things that are running now but will NOT come
+#                   back after a reboot, and records a baseline of what is up
+#                   (services, listening ports, mounts, IPs, containers).
+#                   Verdict per host: READY / REVIEW / NOT_READY.
+#
+#   post            Run after the reboot. Compares the host to the baseline
+#                   saved by the "pre" run and reports anything that is gone,
+#                   and whether the host is on the expected kernel.
+#                   Verdict per host: PASS / FAIL / NO_BASELINE.
+#
+# Hand-over between phases: the "pre" run publishes its result as the job
+# artifact reboot_audit_pre. In an AWX workflow, artifacts reach the later
+# nodes automatically as extra variables. Run by hand, pass the same data with
+# -e @pre-artifact.json.
+#
+# Other extra variables:
+#   target_hosts      limit the run (default: all)
+#   fail_on_problem   true = fail the host when the verdict is NOT_READY / FAIL /
+#                     NO_BASELINE, so a workflow or serial:1 reboot job stops
+#                     there (default: false)
+#
+# BLOCKER = very likely will not come back. WARNING = check by hand.
+#
+# What it checks (pre):
+#   BLOCKER  service running but not enabled at boot (or only enabled in /run,
+#            or started with systemd-run), unless something else pulls it in
+#   BLOCKER  real filesystem mounted but missing from fstab / mount units
+#   BLOCKER  loop device or dm-crypt (LUKS) volume attached by hand
+#   BLOCKER  docker container with no restart policy
+#   BLOCKER  firewall rules loaded but no persistence service enabled
+#   BLOCKER  target kernel's vmlinuz/initrd missing from /boot
+#   WARNING  non-shell process running inside a login session (started by hand)
+#   WARNING  GRUB may be pinned to a specific entry
+#   WARNING  DKMS modules not built for the target kernel
+#
+# Not covered (check by hand): custom .mount units, native nftables rules,
+# sysctl values set at runtime, custom /etc/rc.local-style scripts, and anything
+# that needs an operator after boot (vault unseal, LUKS passphrase).
+
+- name: Reboot readiness audit and post-reboot comparison
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: true
+  gather_subset:
+    - min
+  become: true
+
+  vars:
+    audit_phase: pre
+    fail_on_problem: false
+    non_persistent_states:
+      - disabled
+      - enabled-runtime
+      - transient
+      - linked
+      - linked-runtime
+      - masked-runtime
+    pre_baseline_all: "{{ reboot_audit_pre | default({}) }}"
+
+  tasks:
+    - name: Collect read-only state in one pass
+      ansible.builtin.shell:
+        cmd: |
+          {% raw %}
+          set -o pipefail
+          sec() { printf '@@%s\n' "$1"; }
+          have() { command -v "$1" >/dev/null 2>&1; }
+          SVC='systemctl list-units --type=service --state=running --plain --no-legend --no-pager'
+
+          sec running_services
+          $SVC 2>/dev/null | awk '{print $1}' | sort -u
+
+          sec service_state
+          $SVC 2>/dev/null | awk '{print $1}' | sort -u | while read -r u; do
+            t="$u"; case "$u" in *@*.service) t="${u%%@*}@.service";; esac
+            st=$(systemctl show -p UnitFileState --value "$t" 2>/dev/null)
+            act=$(systemctl show -p TriggeredBy -p WantedBy -p RequiredBy --value "$u" 2>/dev/null | tr -s ' \n' ' ')
+            printf '%s|%s|%s\n' "$u" "${st:-transient}" "$act"
+          done
+
+          sec ports
+          ss -H -tuln 2>/dev/null | awk '{n=split($5,a,":"); print $1":"a[n]}' | sort -u
+
+          sec mounts_runtime
+          findmnt -rn -o TARGET,SOURCE,FSTYPE 2>/dev/null \
+            | awk '$3 ~ /^(ext2|ext3|ext4|xfs|btrfs|vfat|nfs|nfs4|cifs|zfs|f2fs|fuseblk|ntfs|ntfs3)$/ {print $1"|"$2"|"$3}' \
+            | while IFS='|' read -r t s f; do
+                mu=$(systemd-escape -p --suffix=mount "$t" 2>/dev/null)
+                us=$(systemctl show -p UnitFileState --value "$mu" 2>/dev/null)
+                printf '%s|%s|%s|%s\n' "$t" "$s" "$f" "${us:-none}"
+              done
+
+          sec fstab_targets
+          findmnt --fstab -rn -o TARGET 2>/dev/null | sort -u
+          sec fstab_sources
+          findmnt --fstab -rn -o SOURCE 2>/dev/null | sort -u
+
+          sec loops
+          losetup -nl -O NAME,BACK-FILE 2>/dev/null | grep -v '/snapd/' | awk 'NF>=2 {print $1"|"$2}'
+          sec crypt_active
+          lsblk -rno NAME,TYPE 2>/dev/null | awk '$2=="crypt"{print $1}' | sort -u
+          sec crypttab
+          grep -hvE '^[[:space:]]*(#|$)' /etc/crypttab 2>/dev/null | awk '{print $1}' | sort -u
+
+          sec addresses
+          ip -4 -br addr show scope global 2>/dev/null \
+            | grep -vE '^(docker|br-|veth|cni|flannel|cali|virbr)' \
+            | awk '{for(i=3;i<=NF;i++) print $1"|"$i}'
+          sec route
+          ip -4 route show default 2>/dev/null | awk '{print $3"|"$5}'
+
+          sec containers
+          if have docker && docker info >/dev/null 2>&1; then
+            ids=$(docker ps -q 2>/dev/null)
+            [ -n "$ids" ] && docker inspect -f '{{.Name}}|{{.HostConfig.RestartPolicy.Name}}|{{.Config.Image}}' $ids 2>/dev/null | sed 's#^/##'
+          fi
+
+          sec firewall
+          n=0
+          if have iptables-save; then
+            n=$(iptables-save 2>/dev/null | grep -E '^-A' | grep -viE 'docker|br-|veth|kube|cni|f2b|fail2ban' | wc -l)
+          fi
+          persist=""
+          for s in ufw netfilter-persistent nftables firewalld iptables; do
+            [ "$(systemctl is-enabled "$s" 2>/dev/null)" = enabled ] && persist="$persist $s"
+          done
+          printf 'runtime_rules|%s\npersistence|%s\n' "$n" "${persist# }"
+
+          sec boot
+          run=$(uname -r); flavor=${run##*-}
+          target=$(dpkg-query -W -f='${db:Status-Abbrev}|${Package}\n' 'linux-image-[0-9]*' 'linux-image-unsigned-[0-9]*' 2>/dev/null \
+            | awk -F'|' '$1 ~ /^ii/ {print $2}' | sed -E 's/^linux-image-(unsigned-)?//' | sort -uV | grep -- "-${flavor}$" | tail -1)
+          echo "running|$run"
+          echo "target|$target"
+          if [ -n "$target" ]; then
+            [ -e "/boot/vmlinuz-$target" ] && echo "vmlinuz|yes" || echo "vmlinuz|no"
+            [ -e "/boot/initrd.img-$target" ] && echo "initrd|yes" || echo "initrd|no"
+          fi
+          echo "grub_default|$(grep -E '^GRUB_DEFAULT=' /etc/default/grub 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"')"
+          echo "saved_entry|$(grub-editenv list 2>/dev/null | grep '^saved_entry=' | cut -d= -f2-)"
+          echo "uptime_days|$(awk '{print int($1/86400)}' /proc/uptime)"
+          if have dkms && [ -n "$target" ]; then
+            d=$(dkms status 2>/dev/null)
+            echo "dkms_running|$(printf '%s\n' "$d" | grep -F "$run" | grep -c installed)"
+            echo "dkms_target|$(printf '%s\n' "$d" | grep -F "$target" | grep -c installed)"
+          fi
+
+          sec manual_procs
+          ps -eo pid=,user=,comm=,cgroup= 2>/dev/null \
+            | awk '$NF ~ /session-[0-9]+\.scope/ && $3 !~ /^(sshd|sshd-session|bash|-bash|sh|zsh|sudo|su|login|ps|awk|python3?|\(sd-pam\)|systemd|sleep|ssh-agent|dbus-daemon|sftp-server|scp)$/ {print $2"|"$3"|"$1}'
+          true
+          {% endraw %}
+        executable: /bin/bash
+      register: audit_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Parse the collected sections
+      ansible.builtin.set_fact:
+        sec: >-
+          {%- set ns = namespace(cur='none', d={
+                'running_services': [], 'service_state': [], 'ports': [],
+                'mounts_runtime': [], 'fstab_targets': [], 'fstab_sources': [],
+                'loops': [], 'crypt_active': [], 'crypttab': [],
+                'addresses': [], 'route': [], 'containers': [],
+                'firewall': [], 'boot': [], 'manual_procs': [], 'none': []}) -%}
+          {%- for line in audit_raw.stdout_lines -%}
+            {%- if line.startswith('@@') -%}
+              {%- set ns.cur = line[2:] -%}
+            {%- elif line | trim != '' -%}
+              {%- set _ = ns.d[ns.cur].append(line | trim) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ ns.d }}
+
+    - name: Evaluate findings
+      vars:
+        svc_rows: "{{ sec.service_state | map('split', '|') | list }}"
+        svc_np: "{{ svc_rows | selectattr('1', 'in', non_persistent_states) | list }}"
+        svc_manual: "{{ svc_np | rejectattr('2', 'search', '[^ ]') | map(attribute='0') | list }}"
+        svc_pulled: "{{ svc_np | selectattr('2', 'search', '[^ ]') | map(attribute='0') | list }}"
+        mnt_rows: "{{ sec.mounts_runtime | map('split', '|') | list }}"
+        mnt_manual: "{{ mnt_rows | rejectattr('0', 'equalto', '/') | rejectattr('0', 'in', sec.fstab_targets) | rejectattr('3', 'equalto', 'enabled') | map(attribute='0') | list }}"
+        loop_manual: "{{ sec.loops | map('split', '|') | rejectattr('1', 'in', sec.fstab_sources) | map(attribute='1') | list }}"
+        crypt_manual: "{{ sec.crypt_active | reject('in', sec.crypttab) | list }}"
+        ctr_rows: "{{ sec.containers | map('split', '|') | list }}"
+        ctr_norestart: "{{ ctr_rows | selectattr('1', 'in', ['', 'no']) | map(attribute='0') | list }}"
+        fw: "{{ dict(sec.firewall | map('split', '|') | list) }}"
+        boot: "{{ dict(sec.boot | map('split', '|') | list) }}"
+        proc_rows: "{{ sec.manual_procs | map('split', '|') | list }}"
+        base_services: "{{ sec.running_services | reject('match', '^(user@|user-runtime-dir@)') | list }}"
+        base_mounts: "{{ mnt_rows | map(attribute='0') | list }}"
+        base_containers: "{{ ctr_rows | map(attribute='0') | list }}"
+        baseline_now:
+          services: "{{ base_services }}"
+          ports: "{{ sec.ports }}"
+          mounts: "{{ base_mounts }}"
+          addresses: "{{ sec.addresses }}"
+          route: "{{ sec.route }}"
+          containers: "{{ base_containers }}"
+        pre: "{{ pre_baseline_all[inventory_hostname] | default({}) }}"
+        pre_base: "{{ pre.baseline | default({}) }}"
+        grub_pinned: "{{ (boot.grub_default | default('')) not in ['', '0', 'saved'] or ((boot.grub_default | default('')) == 'saved' and (boot.saved_entry | default('')) != '') }}"
+      ansible.builtin.set_fact:
+        blockers: >-
+          {%- set b = [] -%}
+          {%- if audit_phase == 'pre' -%}
+            {%- for u in svc_manual -%}{%- set _ = b.append('Service ' ~ u ~ ' is running but will not start at boot (not enabled, nothing pulls it in)') -%}{%- endfor -%}
+            {%- for m in mnt_manual -%}{%- set _ = b.append('Mount ' ~ m ~ ' is not in fstab or an enabled mount unit; it will be missing after reboot') -%}{%- endfor -%}
+            {%- for l in loop_manual -%}{%- set _ = b.append('Loop device on ' ~ l ~ ' was attached by hand; it will not be re-attached') -%}{%- endfor -%}
+            {%- for c in crypt_manual -%}{%- set _ = b.append('Encrypted volume ' ~ c ~ ' is open but not in /etc/crypttab; it needs a manual unlock after reboot') -%}{%- endfor -%}
+            {%- for c in ctr_norestart -%}{%- set _ = b.append('Container ' ~ c ~ ' has no restart policy; it will stay down after reboot') -%}{%- endfor -%}
+            {%- if (fw.runtime_rules | default('0') | int) > 0 and (fw.persistence | default('')) == '' -%}
+              {%- set _ = b.append('Firewall has ' ~ fw.runtime_rules ~ ' loaded rules but no persistence service (ufw, netfilter-persistent, nftables, firewalld) is enabled') -%}
+            {%- endif -%}
+            {%- if boot.target | default('') != '' and (boot.vmlinuz | default('yes') == 'no' or boot.initrd | default('yes') == 'no') -%}
+              {%- set _ = b.append('Files for kernel ' ~ boot.target ~ ' are missing from /boot (vmlinuz: ' ~ boot.vmlinuz | default('?') ~ ', initrd: ' ~ boot.initrd | default('?') ~ ')') -%}
+            {%- endif -%}
+          {%- else -%}
+            {%- if not pre_base -%}
+              {%- set _ = b.append('No pre-reboot baseline found for this host; cannot verify (pass reboot_audit_pre)') -%}
+            {%- else -%}
+              {%- if pre.target_kernel | default('') != '' and boot.running != pre.target_kernel -%}
+                {%- set _ = b.append('Host is on kernel ' ~ boot.running ~ ', expected ' ~ pre.target_kernel) -%}
+              {%- endif -%}
+              {%- for s in pre_base.services | default([]) | difference(baseline_now.services) -%}{%- set _ = b.append('Service no longer running: ' ~ s) -%}{%- endfor -%}
+              {%- for p in pre_base.ports | default([]) | difference(baseline_now.ports) -%}{%- set _ = b.append('Port no longer listening: ' ~ p) -%}{%- endfor -%}
+              {%- for m in pre_base.mounts | default([]) | difference(baseline_now.mounts) -%}{%- set _ = b.append('Mount missing: ' ~ m) -%}{%- endfor -%}
+              {%- for a in pre_base.addresses | default([]) | difference(baseline_now.addresses) -%}{%- set _ = b.append('Address missing: ' ~ a) -%}{%- endfor -%}
+              {%- for r in pre_base.route | default([]) | difference(baseline_now.route) -%}{%- set _ = b.append('Default route missing: ' ~ r) -%}{%- endfor -%}
+              {%- for c in pre_base.containers | default([]) | difference(baseline_now.containers) -%}{%- set _ = b.append('Container not running: ' ~ c) -%}{%- endfor -%}
+            {%- endif -%}
+          {%- endif -%}
+          {{ b }}
+        warnings: >-
+          {%- set w = [] -%}
+          {%- if audit_phase == 'pre' -%}
+            {%- for p in proc_rows -%}{%- set _ = w.append('Process ' ~ p[1] ~ ' (pid ' ~ p[2] ~ ', user ' ~ p[0] ~ ') runs inside a login session, probably started by hand') -%}{%- endfor -%}
+            {%- if grub_pinned -%}
+              {%- set _ = w.append('GRUB may boot a pinned entry (GRUB_DEFAULT=' ~ boot.grub_default | default('') ~ ', saved_entry=' ~ boot.saved_entry | default('') ~ '); confirm it will pick ' ~ boot.target | default('?')) -%}
+            {%- endif -%}
+            {%- if (boot.dkms_running | default('0') | int) > (boot.dkms_target | default('0') | int) -%}
+              {%- set _ = w.append('DKMS: ' ~ boot.dkms_running ~ ' module(s) installed for the running kernel but only ' ~ boot.dkms_target ~ ' for ' ~ boot.target) -%}
+            {%- endif -%}
+          {%- endif -%}
+          {{ w }}
+
+    - name: Build the host result
+      vars:
+        verdict_pre: "{{ 'NOT_READY' if blockers | length > 0 else ('REVIEW' if warnings | length > 0 else 'READY') }}"
+        boot: "{{ dict(sec.boot | map('split', '|') | list) }}"
+        svc_pulled: "{{ sec.service_state | map('split', '|') | list | selectattr('1', 'in', non_persistent_states) | selectattr('2', 'search', '[^ ]') | map(attribute='0') | list }}"
+        verdict_post: "{{ 'NO_BASELINE' if (pre_baseline_all[inventory_hostname] | default({})) == {} else ('FAIL' if blockers | length > 0 else 'PASS') }}"
+      ansible.builtin.set_fact:
+        audit:
+          phase: "{{ audit_phase }}"
+          status: "{{ verdict_pre if audit_phase == 'pre' else verdict_post }}"
+          running_kernel: "{{ boot.running | default('?') }}"
+          target_kernel: "{{ boot.target | default('') }}"
+          uptime_days: "{{ boot.uptime_days | default('0') | int }}"
+          blockers: "{{ blockers }}"
+          warnings: "{{ warnings }}"
+          notes: >-
+            {{ (['Up ' ~ boot.uptime_days | default('0') ~ ' days: runtime-only changes since boot will be lost'])
+               + (svc_pulled | map('regex_replace', '^', 'Not enabled but pulled in by another unit: ') | list) }}
+          baseline:
+            services: "{{ sec.running_services | reject('match', '^(user@|user-runtime-dir@)') | list }}"
+            ports: "{{ sec.ports }}"
+            mounts: "{{ sec.mounts_runtime | map('split', '|') | map(attribute='0') | list }}"
+            addresses: "{{ sec.addresses }}"
+            route: "{{ sec.route }}"
+            containers: "{{ sec.containers | map('split', '|') | map(attribute='0') | list }}"
+
+    # In an AWX workflow this reaches later nodes as reboot_audit_pre /
+    # reboot_audit_post extra variables.
+    - name: Publish result to job artifacts
+      ansible.builtin.set_stats:
+        data: "{{ {'reboot_audit_' ~ audit_phase: {inventory_hostname: audit}} }}"
+        per_host: false
+        aggregate: true
+
+    - name: Print per-host verdict and findings
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['%-34s %-12s %-20s %-20s %3s %3s %6s' | format(
+                'HOST', 'VERDICT', 'RUNNING', 'TARGET', 'BLK', 'WRN', 'UP(d)'),
+              '%-34s %-12s %-20s %-20s %3s %3s %6s' | format(
+                inventory_hostname, audit.status, audit.running_kernel, audit.target_kernel | default('-', true),
+                audit.blockers | length, audit.warnings | length, audit.uptime_days)]
+             + (audit.blockers | map('regex_replace', '^', '    BLOCKER: ') | list)
+             + (audit.warnings | map('regex_replace', '^', '    WARNING: ') | list) }}
+
+    - name: Fleet totals
+      run_once: true  # noqa: run-once[task]
+      delegate_to: localhost
+      vars:
+        reports: "{{ ansible_play_hosts_all | map('extract', hostvars, 'audit') | select('defined') | list }}"
+      ansible.builtin.debug:
+        msg: >-
+          Phase {{ audit_phase }}: {{ reports | length }} of {{ ansible_play_hosts_all | length }} hosts reported
+          (unreachable hosts are in the AWX job summary).
+          {% for s in ['READY', 'REVIEW', 'NOT_READY', 'PASS', 'FAIL', 'NO_BASELINE'] -%}
+          {% set n = reports | selectattr('status', 'equalto', s) | list | length -%}
+          {% if n > 0 %}{{ s }}: {{ n }}. {% endif -%}
+          {% endfor %}
+
+    - name: Stop on problems when asked to
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }}: {{ audit.status }} ({{ audit.blockers | length }} blocker(s))"
+      when:
+        - fail_on_problem | bool
+        - audit.status in ['NOT_READY', 'FAIL', 'NO_BASELINE']

@@ -1,0 +1,231 @@
+---
+# yamllint disable rule:line-length
+# fix-logrotate-aide.yml
+#
+# Fixes the two units that show up in `systemctl --failed` on every host:
+#
+#   logrotate.service
+#     Cause: the Elyvium hardening role (general/log_rotation) writes
+#     /etc/logrotate.d/elyvium-security, which lists /var/log/auth.log. Ubuntu's own
+#     /etc/logrotate.d/rsyslog lists it too. logrotate refuses a log listed twice
+#     ("rsyslog:1 duplicate log entry for /var/log/auth.log"), skips the WHOLE
+#     rsyslog file, and exits 1. Result: syslog, kern.log, daemon.log, mail.*, ...
+#     are never rotated and keep growing.
+#     Fix: remove the auth.log line from the package's rsyslog file. The Elyvium file
+#     keeps rotating auth.log (weekly, 12 generations). Verified with `logrotate -d`
+#     before it counts as fixed; the old file is restored if the check still fails.
+#     Nothing else is touched; any other logrotate error is only reported.
+#
+#   dailyaidecheck.service
+#     Cause: aide-common ships a daily timer, but general/file_integrity_monitoring
+#     deliberately never initialises the AIDE database (initialize_aide_database:
+#     false). With no database the check exits 1 within a second, every day.
+#     This is a decision, not a bug, so by default the playbook only reports.
+#
+# Extra variables:
+#   target_hosts        limit the run (default: all)
+#   aide_mode           report (default) | disable
+#                       disable = mask dailyaidecheck.timer and remove
+#                       /etc/cron.d/elyvium-aide-check, ONLY on hosts that have no
+#                       AIDE database (a working AIDE is never touched)
+#   run_logrotate_now   true = start logrotate.service right after the fix so the
+#                       backlog is rotated now instead of at midnight (default false)
+#
+# Run it once as an AWX "Check" job first: it shows the diff and changes nothing.
+# Never restarts a service, never reboots.
+
+- name: Fix logrotate duplicate and report/handle AIDE
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    aide_mode: report
+    run_logrotate_now: false
+    logrotate_conf: /etc/logrotate.conf
+    logrotate_dir: /etc/logrotate.d
+
+  tasks:
+    # ------------------------------------------------------------ logrotate
+    - name: Test logrotate configuration (debug mode, rotates nothing)
+      ansible.builtin.command: "logrotate -d {{ logrotate_conf }}"
+      register: lr_before
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Find which files list /var/log/auth.log
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -rlE
+          - '(^|[[:space:]])/var/log/auth[.]log([[:space:]{]|$)'
+          - "{{ logrotate_conf }}"
+          - "{{ logrotate_dir }}"
+      register: authlog_files
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Classify logrotate state
+      vars:
+        lr_lines: "{{ (lr_before.stdout ~ '\n' ~ lr_before.stderr).splitlines() }}"
+        lr_errors: "{{ lr_lines | select('search', '^error:') | list }}"
+        known_dup_line: "{{ lr_errors | select('search', 'rsyslog:[0-9]+ duplicate log entry for /var/log/auth[.]log') | list }}"
+        other_errors: "{{ lr_errors | reject('search', 'duplicate log entry for /var/log/auth[.]log') | reject('search', 'found error in file rsyslog') | list }}"
+        listed_in: "{{ authlog_files.stdout_lines }}"
+        others: "{{ listed_in | reject('equalto', logrotate_dir ~ '/rsyslog') | list }}"
+      ansible.builtin.set_fact:
+        lr_errors: "{{ lr_errors }}"
+        lr_others: "{{ others }}"
+        lr_result: >-
+          {{ 'OK' if lr_errors | length == 0 else
+             ('NEEDS_FIX' if (known_dup_line | length > 0 and other_errors | length == 0 and others | length > 0
+                              and (logrotate_dir ~ '/rsyslog') in listed_in) else 'UNKNOWN_ERROR') }}
+
+    - name: Check the other stanza reopens rsyslog files after rotating auth.log
+      ansible.builtin.command:
+        argv: "{{ ['grep', '-lE', 'rsyslog'] + lr_others }}"
+      register: reopen_out
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: lr_result == 'NEEDS_FIX'
+
+    - name: Remove the duplicate from the package's rsyslog file
+      when: lr_result == 'NEEDS_FIX'
+      block:
+        - name: Drop auth.log from the rsyslog logrotate file
+          ansible.builtin.lineinfile:
+            path: "{{ logrotate_dir }}/rsyslog"
+            regexp: '^\s*/var/log/auth\.log\s*$'
+            state: absent
+            backup: true
+          register: lr_fix
+
+        - name: Re-test logrotate configuration
+          ansible.builtin.command: "logrotate -d {{ logrotate_conf }}"
+          register: lr_after
+          changed_when: false
+          failed_when: false
+          when: not ansible_check_mode
+
+        - name: Fail (and roll back) if it is still broken
+          ansible.builtin.fail:
+            msg: "logrotate still reports errors after the change"
+          when:
+            - not ansible_check_mode
+            - (lr_after.stdout ~ lr_after.stderr) is search('(^|\n)error:')
+
+        - name: Mark as fixed
+          ansible.builtin.set_fact:
+            lr_result: "{{ 'WOULD_FIX' if ansible_check_mode else 'FIXED' }}"
+
+      rescue:
+        - name: Restore the original rsyslog logrotate file
+          ansible.builtin.copy:
+            src: "{{ lr_fix.backup }}"
+            dest: "{{ logrotate_dir }}/rsyslog"
+            remote_src: true
+            mode: preserve
+          when: lr_fix.backup is defined and lr_fix.backup | length > 0
+
+        - name: Mark as rolled back
+          ansible.builtin.set_fact:
+            lr_result: ROLLED_BACK
+
+    - name: Rotate the backlog now (optional)
+      ansible.builtin.command: systemctl start logrotate.service  # noqa: command-instead-of-module
+      when:
+        - run_logrotate_now | bool
+        - lr_result == 'FIXED'
+      changed_when: true
+
+    - name: Clear the failed state of logrotate.service
+      ansible.builtin.command: systemctl reset-failed logrotate.service  # noqa: command-instead-of-module
+      when: lr_result == 'FIXED'
+      changed_when: true
+      failed_when: false
+
+    # ----------------------------------------------------------------- AIDE
+    - name: Collect AIDE and disk state
+      ansible.builtin.shell:
+        cmd: |
+          {% raw %}
+          set -o pipefail
+          db=no; for f in /var/lib/aide/aide.db /var/lib/aide/aide.db.gz; do [ -s "$f" ] && db=yes; done
+          echo "db|$db"
+          x=$(systemctl is-enabled dailyaidecheck.timer 2>/dev/null); echo "timer|${x:-absent}"
+          x=$(systemctl is-failed dailyaidecheck.service 2>/dev/null); echo "failed|${x:-unknown}"
+          [ -e /etc/cron.d/elyvium-aide-check ] && echo "cron|yes" || echo "cron|no"
+          echo "var_log|$(du -sh /var/log 2>/dev/null | cut -f1)"
+          echo "var_pct|$(df --output=pcent /var 2>/dev/null | tail -1 | tr -d ' ')"
+          true
+          {% endraw %}
+        executable: /bin/bash
+      register: aide_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Parse AIDE state
+      ansible.builtin.set_fact:
+        aide: "{{ dict(aide_raw.stdout_lines | map('split', '|') | list) }}"
+
+    - name: Disable the unused AIDE check (only when asked, only without a database)
+      when:
+        - aide_mode == 'disable'
+        - aide.db == 'no'
+      block:
+        - name: Mask the daily AIDE timer
+          ansible.builtin.command: systemctl mask --now dailyaidecheck.timer  # noqa: command-instead-of-module
+          when: aide.timer not in ['masked', 'absent']
+          changed_when: true
+
+        - name: Remove the Elyvium AIDE cron check
+          ansible.builtin.file:
+            path: /etc/cron.d/elyvium-aide-check
+            state: absent
+
+        - name: Clear the failed state of dailyaidecheck.service
+          ansible.builtin.command: systemctl reset-failed dailyaidecheck.service  # noqa: command-instead-of-module
+          when: aide.failed == 'failed'
+          changed_when: true
+          failed_when: false
+
+    - name: Work out the AIDE status for the summary
+      ansible.builtin.set_fact:
+        aide_status: >-
+          {{ 'WORKING' if aide.db == 'yes' else
+             ('DISABLED' if (aide_mode == 'disable' or aide.timer == 'masked') else
+              ('NO_DB_TIMER_FAILING' if aide.failed == 'failed' else 'NO_DB')) }}
+
+    # -------------------------------------------------------------- summary
+    - name: Print per-host result
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['%-36s %-14s %-20s %-8s %-8s' | format('HOST', 'LOGROTATE', 'AIDE', '/var/log', '/var use'),
+              '%-36s %-14s %-20s %-8s %-8s' | format(inventory_hostname, lr_result, aide_status, aide.var_log, aide.var_pct)]
+             + (['    NOTE: logrotate errors left alone: ' ~ (lr_errors | join(' | '))] if lr_result == 'UNKNOWN_ERROR' else [])
+             + (['    WARNING: ' ~ (lr_others | join(', ')) ~ ' does not mention rsyslog, so auth.log may not be reopened after rotation; check it has a postrotate'] if (reopen_out is defined and reopen_out.stdout_lines | default([]) | length == 0 and lr_result in ['FIXED', 'WOULD_FIX']) else []) }}
+
+    - name: Fleet totals
+      run_once: true  # noqa: run-once[task]
+      delegate_to: localhost
+      vars:
+        hv: "{{ ansible_play_hosts_all | map('extract', hostvars) | list }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ ansible_play_hosts_all | length }} hosts.
+          {% for s in ['OK', 'NEEDS_FIX', 'WOULD_FIX', 'FIXED', 'ROLLED_BACK', 'UNKNOWN_ERROR'] -%}
+          {% set n = hv | selectattr('lr_result', 'defined') | selectattr('lr_result', 'equalto', s) | list | length -%}
+          {% if n > 0 %}logrotate {{ s }}: {{ n }}. {% endif -%}
+          {% endfor -%}
+          {% for s in ['WORKING', 'DISABLED', 'NO_DB_TIMER_FAILING', 'NO_DB'] -%}
+          {% set n = hv | selectattr('aide_status', 'defined') | selectattr('aide_status', 'equalto', s) | list | length -%}
+          {% if n > 0 %}AIDE {{ s }}: {{ n }}. {% endif -%}
+          {% endfor %}
+
+    - name: Fail the host if logrotate could not be fixed
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }}: logrotate {{ lr_result }}; needs a manual look"
+      when: lr_result in ['ROLLED_BACK', 'UNKNOWN_ERROR']
